@@ -23,7 +23,15 @@ from diffusers.models.transformers.transformer_flux2 import (
 )
 from huggingface_hub import utils
 
-from diffusers.utils import apply_lora_scale
+try:
+    from diffusers.utils import apply_lora_scale
+except ImportError:
+
+    def apply_lora_scale(_kwargs_name: str = "joint_attention_kwargs"):
+        def decorator(func):
+            return func
+
+        return decorator
 
 from ..._C.ops import attention_fp16
 from ...ops.fused import fused_qkv_norm_rottary
@@ -35,11 +43,6 @@ from ...utils import (
     pad_tensor,
 )
 from ..embeddings import pack_rotemb
-try:
-    from ...lora.common.mixin import SVDQLoRAMixin
-except ImportError:
-    SVDQLoRAMixin = None
-
 from ..linear import SVDQW4A4Linear
 from ..utils import CPUOffloadManager, fuse_linears
 from .utils import NunchakuModelLoaderMixin, patch_scale_key
@@ -98,57 +101,12 @@ def _pack_flux2_rotary_emb(freqs_cis: tuple[torch.Tensor, torch.Tensor]) -> torc
     return pack_rotemb(pad_tensor(rotemb, 256, 1))
 
 
-def _pad256(n: int) -> int:
-    return math.ceil(n / 256) * 256
-
-
 def _alloc_packed_qkv(batch_size: int, heads: int, num_tokens: int, head_dim: int, device: torch.device, pad_size: int = 256):
     num_tokens_pad = math.ceil(num_tokens / pad_size) * pad_size
     query = torch.empty(batch_size, heads, num_tokens_pad, head_dim, dtype=torch.float16, device=device)
     key = torch.empty_like(query)
     value = torch.empty_like(query)
     return query, key, value, num_tokens_pad
-
-
-def _copy_attn_attrs(dst, src):
-    """Copy common attention attributes from *src* module to *dst*."""
-    for attr in ("head_dim", "inner_dim", "query_dim", "out_dim", "heads", "use_bias", "dropout"):
-        setattr(dst, attr, getattr(src, attr))
-    processor = getattr(src, "processor", None)
-    dst._attention_backend = getattr(processor, "_attention_backend", None)
-    dst._parallel_config = getattr(processor, "_parallel_config", None)
-
-
-def _dispatch_with_kv_cache(
-    query, key, value,
-    num_txt_tokens: int,
-    num_ref_tokens: int,
-    kv_cache,
-    kv_cache_mode,
-    attention_mask,
-    backend,
-    parallel_config,
-):
-    """Store / retrieve KV cache and dispatch attention."""
-    if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
-        ref_start = num_txt_tokens
-        ref_end = num_txt_tokens + num_ref_tokens
-        kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
-
-    if kv_cache_mode == "extract" and num_ref_tokens > 0:
-        return _flux2_kv_causal_attention(
-            query, key, value, num_txt_tokens, num_ref_tokens, backend=backend
-        )
-    if kv_cache_mode == "cached" and kv_cache is not None:
-        return _flux2_kv_causal_attention(
-            query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=backend
-        )
-    return dispatch_attention_fn(
-        query, key, value,
-        attn_mask=attention_mask,
-        backend=backend,
-        parallel_config=parallel_config,
-    )
 
 
 def _apply_gated_residual(residual: torch.Tensor, gate: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
@@ -161,10 +119,19 @@ def _apply_gated_residual(residual: torch.Tensor, gate: torch.Tensor, update: to
 class NunchakuFlux2Attention(Flux2Attention):
     def __init__(self, other: Flux2Attention, **kwargs):
         super(Flux2Attention, self).__init__()
-        _copy_attn_attrs(self, other)
+        self.head_dim = other.head_dim
+        self.inner_dim = other.inner_dim
+        self.query_dim = other.query_dim
+        self.out_dim = other.out_dim
+        self.heads = other.heads
+        self.use_bias = other.use_bias
+        self.dropout = other.dropout
         self.added_kv_proj_dim = other.added_kv_proj_dim
         self.added_proj_bias = other.added_proj_bias
         self.fused_projections = True
+        processor = getattr(other, "processor", None)
+        self._attention_backend = getattr(processor, "_attention_backend", None)
+        self._parallel_config = getattr(processor, "_parallel_config", None)
 
         self.norm_q = other.norm_q
         self.norm_k = other.norm_k
@@ -206,12 +173,14 @@ class NunchakuFlux2Attention(Flux2Attention):
             batch_size = hidden_states.shape[0]
             num_txt_tokens = encoder_hidden_states.shape[1]
             num_img_tokens = hidden_states.shape[1]
-            num_txt_tokens_pad = _pad256(num_txt_tokens)
-            num_img_tokens_pad = _pad256(num_img_tokens)
+            num_txt_tokens_pad = math.ceil(num_txt_tokens / 256) * 256
+            num_img_tokens_pad = math.ceil(num_img_tokens / 256) * 256
             num_tokens_pad = num_txt_tokens_pad + num_img_tokens_pad
-            query, key, value, _ = _alloc_packed_qkv(
-                batch_size, self.heads, num_tokens_pad, self.head_dim, hidden_states.device, pad_size=num_tokens_pad
+            query = torch.empty(
+                batch_size, self.heads, num_tokens_pad, self.head_dim, dtype=torch.float16, device=hidden_states.device
             )
+            key = torch.empty_like(query)
+            value = torch.empty_like(query)
             fused_qkv_norm_rottary(
                 hidden_states,
                 self.to_qkv,
@@ -308,11 +277,28 @@ class NunchakuFlux2Attention(Flux2Attention):
                 query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
                 key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        hidden_states = _dispatch_with_kv_cache(
-            query, key, value, encoder_seq_len, num_ref_tokens,
-            kv_cache, kv_cache_mode, attention_mask,
-            self._attention_backend, self._parallel_config,
-        )
+        if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+            ref_start = encoder_seq_len
+            ref_end = encoder_seq_len + num_ref_tokens
+            kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            hidden_states = _flux2_kv_causal_attention(
+                query, key, value, encoder_seq_len, num_ref_tokens, backend=self._attention_backend
+            )
+        elif kv_cache_mode == "cached" and kv_cache is not None:
+            hidden_states = _flux2_kv_causal_attention(
+                query, key, value, encoder_seq_len, 0, kv_cache=kv_cache, backend=self._attention_backend
+            )
+        else:
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
         if encoder_seq_len:
@@ -337,14 +323,29 @@ class NunchakuFlux2FeedForward(Flux2FeedForward):
         # so int4 must keep the signed activation path.
         self.linear_out.act_unsigned = False
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear_in(x)
+        x = self.act_fn(x)
+        x = self.linear_out(x)
+        return x
+
 
 class NunchakuFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
     def __init__(self, other: Flux2ParallelSelfAttention, **kwargs):
         super(Flux2ParallelSelfAttention, self).__init__()
-        _copy_attn_attrs(self, other)
+        self.head_dim = other.head_dim
+        self.inner_dim = other.inner_dim
+        self.query_dim = other.query_dim
+        self.out_dim = other.out_dim
+        self.heads = other.heads
+        self.use_bias = other.use_bias
+        self.dropout = other.dropout
         self.mlp_ratio = other.mlp_ratio
         self.mlp_hidden_dim = other.mlp_hidden_dim
         self.mlp_mult_factor = other.mlp_mult_factor
+        processor = getattr(other, "processor", None)
+        self._attention_backend = getattr(processor, "_attention_backend", None)
+        self._parallel_config = getattr(processor, "_parallel_config", None)
 
         # Keep clear parameter names for export/runtime alignment.
         with torch.device("meta"):
@@ -421,11 +422,28 @@ class NunchakuFlux2ParallelSelfAttention(Flux2ParallelSelfAttention):
                 query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
                 key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
-        attn_output = _dispatch_with_kv_cache(
-            query, key, value, num_txt_tokens, num_ref_tokens,
-            kv_cache, kv_cache_mode, attention_mask,
-            self._attention_backend, self._parallel_config,
-        )
+        if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+            ref_start = num_txt_tokens
+            ref_end = num_txt_tokens + num_ref_tokens
+            kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            attn_output = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, num_ref_tokens, backend=self._attention_backend
+            )
+        elif kv_cache_mode == "cached" and kv_cache is not None:
+            attn_output = _flux2_kv_causal_attention(
+                query, key, value, num_txt_tokens, 0, kv_cache=kv_cache, backend=self._attention_backend
+            )
+        else:
+            attn_output = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
         mlp_hidden_states = self.mlp_act_fn(self.mlp_fc1(hidden_states))
         return self.out_proj(attn_output) + self.mlp_fc2(mlp_hidden_states)
@@ -532,189 +550,7 @@ class NunchakuFlux2SingleTransformerBlock(Flux2SingleTransformerBlock):
         return hidden_states
 
 
-_flux2_bases = (Flux2Transformer2DModel, NunchakuModelLoaderMixin)
-if SVDQLoRAMixin is not None:
-    _flux2_bases = _flux2_bases + (SVDQLoRAMixin,)
-
-
-class NunchakuFlux2Transformer2DModel(*_flux2_bases):
-
-    def _pre_convert_lora_sd(self, lora_sd):
-        """Convert BFL-native Flux2 LoRA keys to diffusers convention.
-
-        Handles the ``double_blocks.N.{img,txt}_attn/mlp`` and
-        ``single_blocks.N.linear{1,2}`` key formats produced by
-        non-diffusers Flux2 LoRA trainers.
-        """
-        has_bfl = any(
-            k.startswith("double_blocks.") or k.startswith("single_blocks.")
-            for k in lora_sd
-        )
-        if not has_bfl:
-            return lora_sd
-
-        out: dict[str, torch.Tensor] = {}
-        consumed: set[str] = set()
-
-        num_double = 0
-        num_single = 0
-        for k in lora_sd:
-            if k.startswith("double_blocks."):
-                num_double = max(num_double, int(k.split(".")[1]) + 1)
-            elif k.startswith("single_blocks."):
-                num_single = max(num_single, int(k.split(".")[1]) + 1)
-
-        lora_suffixes = ("lora_A.weight", "lora_B.weight")
-
-        for sl in range(num_single):
-            sp = f"single_blocks.{sl}"
-            dp = f"single_transformer_blocks.{sl}.attn"
-            for sfx in lora_suffixes:
-                lin1 = f"{sp}.linear1.{sfx}"
-                if lin1 in lora_sd:
-                    out[f"{dp}.to_qkv_mlp_proj.{sfx}"] = lora_sd[lin1]
-                    consumed.add(lin1)
-                lin2 = f"{sp}.linear2.{sfx}"
-                if lin2 in lora_sd:
-                    out[f"{dp}.to_out.{sfx}"] = lora_sd[lin2]
-                    consumed.add(lin2)
-
-        for dl in range(num_double):
-            bp = f"double_blocks.{dl}"
-            tp = f"transformer_blocks.{dl}"
-
-            for sfx in lora_suffixes:
-                is_a = sfx.startswith("lora_A")
-                for attn_type in ("img_attn", "txt_attn"):
-                    qkv_key = f"{bp}.{attn_type}.qkv.{sfx}"
-                    if qkv_key not in lora_sd:
-                        continue
-                    consumed.add(qkv_key)
-                    fused = lora_sd[qkv_key]
-                    if attn_type == "img_attn":
-                        proj_names = ["to_q", "to_k", "to_v"]
-                    else:
-                        proj_names = ["add_q_proj", "add_k_proj", "add_v_proj"]
-                    if is_a:
-                        for pn in proj_names:
-                            out[f"{tp}.attn.{pn}.{sfx}"] = fused.clone()
-                    else:
-                        parts = torch.chunk(fused, 3, dim=0)
-                        for pn, part in zip(proj_names, parts):
-                            out[f"{tp}.attn.{pn}.{sfx}"] = part.contiguous()
-
-            proj_map = [
-                ("img_attn.proj", "attn.to_out.0"),
-                ("txt_attn.proj", "attn.to_add_out"),
-            ]
-            for org, diff in proj_map:
-                for sfx in lora_suffixes:
-                    k = f"{bp}.{org}.{sfx}"
-                    if k in lora_sd:
-                        out[f"{tp}.{diff}.{sfx}"] = lora_sd[k]
-                        consumed.add(k)
-
-            mlp_map = [
-                ("img_mlp.0", "ff.linear_in"),
-                ("img_mlp.2", "ff.linear_out"),
-                ("txt_mlp.0", "ff_context.linear_in"),
-                ("txt_mlp.2", "ff_context.linear_out"),
-            ]
-            for org, diff in mlp_map:
-                for sfx in lora_suffixes:
-                    k = f"{bp}.{org}.{sfx}"
-                    if k in lora_sd:
-                        out[f"{tp}.{diff}.{sfx}"] = lora_sd[k]
-                        consumed.add(k)
-
-        for k, v in lora_sd.items():
-            if k not in consumed:
-                out[k] = v
-
-        n = len(consumed)
-        if n:
-            print(f"Flux2 BFL key conversion: {n} keys converted")
-
-        return out
-
-    def _lora_key_map(self):
-        return {
-            "block_prefixes": ["transformer_blocks", "single_transformer_blocks"],
-            "quantized_targets": {
-                # ── double stream blocks (Flux2TransformerBlock) ──
-                "attn.to_qkv": {
-                    "lora_keys": ["attn.to_q", "attn.to_k", "attn.to_v"],
-                    "type": "fused_qkv",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "attn.to_added_qkv": {
-                    "lora_keys": ["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"],
-                    "type": "fused_qkv",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "attn.to_out.0": {
-                    "lora_keys": ["attn.to_out.0"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "attn.to_add_out": {
-                    "lora_keys": ["attn.to_add_out"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "ff.linear_in": {
-                    "lora_keys": ["ff.linear_in"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "ff.linear_out": {
-                    "lora_keys": ["ff.linear_out"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "ff_context.linear_in": {
-                    "lora_keys": ["ff_context.linear_in"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                "ff_context.linear_out": {
-                    "lora_keys": ["ff_context.linear_out"],
-                    "type": "linear",
-                    "applies_to": ["transformer_blocks"],
-                },
-                # ── single stream blocks (Flux2SingleTransformerBlock) ──
-                # Format 1: fused LoRA on attn.to_qkv_mlp_proj (split B by output dim)
-                "_fused_qkv_mlp": {
-                    "lora_keys": ["attn.to_qkv_mlp_proj"],
-                    "type": "fused_split",
-                    "targets": ["attn.qkv_proj", "attn.mlp_fc1"],
-                    "split_dim": "output",
-                    "applies_to": ["single_transformer_blocks"],
-                },
-                # Format 1: fused LoRA on attn.to_out (split A by input dim)
-                "_fused_out": {
-                    "lora_keys": ["attn.to_out"],
-                    "type": "fused_split",
-                    "targets": ["attn.out_proj", "attn.mlp_fc2"],
-                    "split_dim": "input",
-                    "applies_to": ["single_transformer_blocks"],
-                },
-                # Format 2: separate Q/K/V LoRA (fused into qkv_proj)
-                "attn.qkv_proj": {
-                    "lora_keys": ["attn.to_q", "attn.to_k", "attn.to_v"],
-                    "type": "fused_qkv",
-                    "applies_to": ["single_transformer_blocks"],
-                },
-                # Format 2: separate proj_mlp LoRA
-                "attn.mlp_fc1": {
-                    "lora_keys": ["proj_mlp"],
-                    "type": "linear",
-                    "applies_to": ["single_transformer_blocks"],
-                },
-            },
-            "unquantized_targets": {},
-        }
-
+class NunchakuFlux2Transformer2DModel(Flux2Transformer2DModel, NunchakuModelLoaderMixin):
     def _patch_model(self, **kwargs):
         for i, block in enumerate(self.transformer_blocks):
             self.transformer_blocks[i] = NunchakuFlux2TransformerBlock(block, **kwargs)
@@ -759,27 +595,6 @@ class NunchakuFlux2Transformer2DModel(*_flux2_bases):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-    def _run_blocks(self, blocks, offload_manager, block_args, use_grad_ckpt):
-        """Iterate over transformer blocks with optional CPU offloading and gradient checkpointing."""
-        if offload_manager is not None:
-            compute_stream = torch.cuda.current_stream()
-            offload_manager.initialize(compute_stream)
-            for idx in range(len(blocks)):
-                with torch.cuda.stream(compute_stream):
-                    block = offload_manager.get_block(idx)
-                    if use_grad_ckpt:
-                        result = self._gradient_checkpointing_func(block, *block_args)
-                    else:
-                        result = block(*block_args)
-                offload_manager.step(compute_stream)
-        else:
-            for block in blocks:
-                if use_grad_ckpt:
-                    result = self._gradient_checkpointing_func(block, *block_args)
-                else:
-                    result = block(*block_args)
-        return result
 
     @apply_lora_scale("joint_attention_kwargs")
     def forward(
@@ -844,28 +659,101 @@ class NunchakuFlux2Transformer2DModel(*_flux2_bases):
                 torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
             )
         )
+        kv_attn_kwargs = joint_attention_kwargs
 
-        use_grad_ckpt = torch.is_grad_enabled() and self.gradient_checkpointing
-        offload_mgr = self.transformer_block_offload_manager if self.offload else None
-        double_args = (
-            hidden_states, encoder_hidden_states,
-            double_stream_mod_img, double_stream_mod_txt,
-            (rotary_emb_img, rotary_emb_txt), joint_attention_kwargs,
-        )
-        encoder_hidden_states, hidden_states = self._run_blocks(
-            self.transformer_blocks, offload_mgr, double_args, use_grad_ckpt
-        )
+        if self.offload:
+            compute_stream = torch.cuda.current_stream()
+            self.transformer_block_offload_manager.initialize(compute_stream)
+            for index_block in range(len(self.transformer_blocks)):
+                with torch.cuda.stream(compute_stream):
+                    block = self.transformer_block_offload_manager.get_block(index_block)
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                            block,
+                            hidden_states,
+                            encoder_hidden_states,
+                            double_stream_mod_img,
+                            double_stream_mod_txt,
+                            (rotary_emb_img, rotary_emb_txt),
+                            kv_attn_kwargs,
+                        )
+                    else:
+                        encoder_hidden_states, hidden_states = block(
+                            hidden_states=hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            temb_mod_img=double_stream_mod_img,
+                            temb_mod_txt=double_stream_mod_txt,
+                            image_rotary_emb=(rotary_emb_img, rotary_emb_txt),
+                            joint_attention_kwargs=kv_attn_kwargs,
+                        )
+                self.transformer_block_offload_manager.step(compute_stream)
+        else:
+            for index_block, block in enumerate(self.transformer_blocks):
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        double_stream_mod_img,
+                        double_stream_mod_txt,
+                        (rotary_emb_img, rotary_emb_txt),
+                        kv_attn_kwargs,
+                    )
+                else:
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb_mod_img=double_stream_mod_img,
+                        temb_mod_txt=double_stream_mod_txt,
+                        image_rotary_emb=(rotary_emb_img, rotary_emb_txt),
+                        joint_attention_kwargs=kv_attn_kwargs,
+                    )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        kv_attn_kwargs_single = kv_attn_kwargs
 
-        offload_mgr = self.single_transformer_block_offload_manager if self.offload else None
-        single_args = (
-            hidden_states, None,
-            single_stream_mod, rotary_emb_single, joint_attention_kwargs,
-        )
-        hidden_states = self._run_blocks(
-            self.single_transformer_blocks, offload_mgr, single_args, use_grad_ckpt
-        )
+        if self.offload:
+            self.single_transformer_block_offload_manager.initialize(compute_stream)
+            for index_block in range(len(self.single_transformer_blocks)):
+                with torch.cuda.stream(compute_stream):
+                    block = self.single_transformer_block_offload_manager.get_block(index_block)
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        hidden_states = self._gradient_checkpointing_func(
+                            block,
+                            hidden_states,
+                            None,
+                            single_stream_mod,
+                            rotary_emb_single,
+                            kv_attn_kwargs_single,
+                        )
+                    else:
+                        hidden_states = block(
+                            hidden_states=hidden_states,
+                            encoder_hidden_states=None,
+                            temb_mod=single_stream_mod,
+                            image_rotary_emb=rotary_emb_single,
+                            joint_attention_kwargs=kv_attn_kwargs_single,
+                        )
+                self.single_transformer_block_offload_manager.step(compute_stream)
+        else:
+            for index_block, block in enumerate(self.single_transformer_blocks):
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    hidden_states = self._gradient_checkpointing_func(
+                        block,
+                        hidden_states,
+                        None,
+                        single_stream_mod,
+                        rotary_emb_single,
+                        kv_attn_kwargs_single,
+                    )
+                else:
+                    hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=None,
+                        temb_mod=single_stream_mod,
+                        image_rotary_emb=rotary_emb_single,
+                        joint_attention_kwargs=kv_attn_kwargs_single,
+                    )
 
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
 
@@ -918,11 +806,6 @@ class NunchakuFlux2Transformer2DModel(*_flux2_bases):
             model_state_dict = pin_state_dict(model_state_dict)
 
         transformer.load_state_dict(model_state_dict)
-
-        if SVDQLoRAMixin is not None and hasattr(transformer, "_init_lora_state"):
-            transformer._init_lora_state()
-        else:
-            print("SVDQLoRAMixin not available, LoRA support is disabled.")
 
         if kwargs.get("return_metadata", False):
             return transformer, metadata
